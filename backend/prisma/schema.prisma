@@ -1,0 +1,172 @@
+// Healthcare Appointment & Follow-up Manager — Database Schema
+// Default datasource is SQLite for zero-config local/dev running.
+// For production, switch provider to "postgresql" and set DATABASE_URL
+// to a Postgres connection string (recommended for real row-locking
+// guarantees — see SYSTEM_DESIGN.md).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite" // change to "postgresql" for production
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum AppointmentStatus {
+  HELD        // slot temporarily reserved while patient fills symptom form
+  BOOKED      // confirmed booking
+  CANCELLED   // cancelled by patient, doctor leave, or admin
+  COMPLETED   // visit finished, post-visit summary generated
+  NO_SHOW
+}
+
+enum NotificationType {
+  BOOKING_CONFIRMATION
+  REMINDER
+  CANCELLATION
+  RESCHEDULE
+  MEDICATION_REMINDER
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  ABANDONED // exceeded max retries
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         Role
+  name         String
+  phone        String?
+  createdAt    DateTime @default(now())
+
+  // Google Calendar OAuth tokens (per-user, so both patient & doctor can sync)
+  googleRefreshToken String?
+  googleAccessToken  String?
+  googleTokenExpiry  DateTime?
+
+  doctorProfile        DoctorProfile? @relation("DoctorUser")
+  patientAppointments  Appointment[]  @relation("PatientAppointments")
+
+  @@index([role])
+}
+
+model DoctorProfile {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  user            User     @relation("DoctorUser", fields: [userId], references: [id])
+  specialisation  String
+  slotDurationMin Int      @default(30)
+  // workingHours: JSON array e.g. [{"day":1,"start":"09:00","end":"17:00"}, ...] day 0=Sun..6=Sat
+  workingHours    String
+  createdAt       DateTime @default(now())
+
+  leaves       DoctorLeave[]
+  appointments Appointment[] @relation("DoctorAppointments")
+
+  @@index([specialisation])
+}
+
+model DoctorLeave {
+  id        String        @id @default(cuid())
+  doctorId  String
+  doctor    DoctorProfile @relation(fields: [doctorId], references: [id])
+  date      String        // "YYYY-MM-DD"
+  reason    String?
+  createdAt DateTime      @default(now())
+
+  @@unique([doctorId, date])
+}
+
+model Appointment {
+  id       String @id @default(cuid())
+  patientId String
+  patient   User   @relation("PatientAppointments", fields: [patientId], references: [id])
+  doctorId  String
+  doctor    DoctorProfile @relation("DoctorAppointments", fields: [doctorId], references: [id])
+
+  slotStart DateTime
+  slotEnd   DateTime
+  status    AppointmentStatus @default(HELD)
+
+  // Slot hold expiry — only meaningful while status = HELD.
+  // A background job releases holds whose holdExpiresAt has passed.
+  holdExpiresAt DateTime?
+
+  // Pre-visit
+  symptomsText     String?
+  previsitSummary  String?   // JSON: {urgency, chiefComplaint, questions[]}
+  previsitLlmError String?
+
+  // Post-visit
+  postvisitNotes    String?  // raw clinical notes + prescription entered by doctor
+  prescriptionJson  String?  // JSON: [{medication, dosage, frequencyPerDay, durationDays}]
+  postvisitSummary  String?  // JSON: patient-friendly summary from LLM
+  postvisitLlmError String?
+
+  // Google Calendar
+  patientCalendarEventId String?
+  doctorCalendarEventId  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  medicationReminders MedicationReminder[]
+  notifications       NotificationLog[]
+
+  // Prevents two BOOKED/HELD rows for the same doctor+slot at the DB level.
+  // Combined with a transaction in the booking route, this is the core
+  // double-booking defense (see SYSTEM_DESIGN.md).
+  @@unique([doctorId, slotStart])
+  @@index([patientId])
+  @@index([status])
+}
+
+model MedicationReminder {
+  id            String      @id @default(cuid())
+  appointmentId String
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  medication    String
+  dosage        String?
+  timesPerDay   Int
+  durationDays  Int
+  startDate     String      // "YYYY-MM-DD"
+  // sendTimes: JSON array of "HH:mm" strings, length == timesPerDay
+  sendTimes     String
+  active        Boolean     @default(true)
+  lastSentAt    DateTime?
+  createdAt     DateTime    @default(now())
+
+  @@index([active])
+}
+
+model NotificationLog {
+  id            String             @id @default(cuid())
+  appointmentId String?
+  appointment   Appointment?       @relation(fields: [appointmentId], references: [id])
+  type          NotificationType
+  channel       String             @default("email") // "email" | "calendar"
+  recipient     String
+  subject       String?
+  bodyHtml      String?
+  status        NotificationStatus @default(PENDING)
+  retryCount    Int                @default(0)
+  maxRetries    Int                @default(5)
+  lastError     String?
+  nextAttemptAt DateTime           @default(now())
+  createdAt     DateTime           @default(now())
+  sentAt        DateTime?
+
+  @@index([status, nextAttemptAt])
+}
